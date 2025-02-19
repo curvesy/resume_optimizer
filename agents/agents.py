@@ -18,11 +18,13 @@ load_dotenv()
 # Get API key
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
-# Initialize the model with the API key
+# Initialize the model with Hyperbolic API configuration
 llm = ChatOpenAI(
-    model="gpt-3.5-turbo",
+    model="meta-llama/Meta-Llama-3.1-8B-Instruct",  # Using Meta-Llama model
+    openai_api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJub29iZXNhbmdAZ21haWwuY29tIiwiaWF0IjoxNzM4ODg3NzEwfQ.XNGj0Nwh3J9DqotbkKT8_ensnfpPS25x2yCRJ4zWufc",  # Your Hyperbolic API key
+    openai_api_base="https://api.hyperbolic.xyz/v1",  # Hyperbolic base URL
     temperature=0,
-    api_key=openai_api_key
+    max_tokens=1024
 )
 
 # Update the browser config
@@ -68,12 +70,22 @@ async def crawl_urls(job_url: str, company_url: str) -> Dict[str, str]:
 def read_resume_pdf(pdf_path: str) -> str:
     """Extract text content from resume PDF"""
     try:
+        # Open file in binary mode
         reader = PdfReader(pdf_path)
         text = ""
         for page in reader.pages:
-            text += page.extract_text()
+            try:
+                text += page.extract_text()
+            except Exception as e:
+                print(f"Warning: Could not extract text from page: {str(e)}")
+                continue
+        
+        if not text:
+            return "Error: Could not extract text from PDF"
+        
         return text
     except Exception as e:
+        print(f"Error reading PDF: {str(e)}")
         return f"Error reading PDF: {str(e)}"
 
 @tool
@@ -182,43 +194,41 @@ app = workflow.compile()
 async def process_application(job_url: str, company_url: str, resume_path: str) -> Dict:
     async with AsyncWebCrawler(config=browser_config) as crawler:
         try:
-            # Crawl job and company pages
+            # Crawl job page only
             job_result = await crawler.arun(url=job_url)
-            company_result = await crawler.arun(url=company_url)
             
-            # Extract job content from the cleaned HTML
+            # Extract only the job description, requirements and tasks
             job_content = ""
-            if job_result and job_result.cleaned_html:
-                # Extract relevant sections from job posting
-                job_content = "\n".join([
-                    section.get_text(strip=True) 
-                    for section in BeautifulSoup(job_result.cleaned_html, 'html.parser').find_all(['h1', 'h2', 'p', 'li'])
-                ])
-            
-            # Extract company content
-            company_content = ""
-            if company_result and company_result.cleaned_html:
-                # Extract relevant sections from company page
-                company_content = "\n".join([
-                    section.get_text(strip=True)
-                    for section in BeautifulSoup(company_result.cleaned_html, 'html.parser').find_all(['h1', 'h2', 'p'])
-                ])
+            if job_result and hasattr(job_result, 'cleaned_html'):
+                soup = BeautifulSoup(job_result.cleaned_html, 'html.parser')
+                
+                # Get main sections
+                sections = []
+                for section in soup.find_all(['h1', 'h2', 'p', 'ul']):
+                    text = section.get_text(strip=True)
+                    if text and not any(skip in text.lower() for skip in [
+                        'cookie', 'datenschutz', 'agb', 'bewerben', 'interessiert',
+                        'dokumente', 'ansprechperson', 'recaptcha'
+                    ]):
+                        sections.append(text)
+                
+                job_content = "\n".join(sections)
+
+            if not job_content:
+                return {"error": "Could not extract job content"}
 
             # Read resume
-            resume_text = ""
-            if os.path.exists(resume_path):
-                reader = PdfReader(resume_path)
-                resume_text = "\n".join(page.extract_text() for page in reader.pages)
+            resume_text = read_resume_pdf(resume_path)
+            
+            if not resume_text:
+                return {"error": "Could not read resume"}
 
             # Prepare the analysis prompt
             analysis_prompt = f"""
-            Please analyze and optimize this resume based on the job posting and company information:
+            Please analyze this resume for the following job posting:
 
             JOB POSTING:
             {job_content}
-
-            COMPANY INFORMATION:
-            {company_content}
 
             RESUME:
             {resume_text}
@@ -229,7 +239,7 @@ async def process_application(job_url: str, company_url: str, resume_path: str) 
             3. Key skills to emphasize
             """
 
-            # Call OpenAI API with correct message format
+            # Call OpenAI API
             result = llm.invoke([
                 SystemMessage(content="You are a professional resume optimization assistant."),
                 HumanMessage(content=analysis_prompt)
@@ -238,16 +248,21 @@ async def process_application(job_url: str, company_url: str, resume_path: str) 
             return {"result": result.content}
             
         except Exception as e:
-            logging.error(f"Error during crawling: {str(e)}")
+            logging.error(f"Error during processing: {str(e)}")
             return {"error": f"Processing error: {str(e)}"}
 
-# Update the test URLs to real ones for testing
 async def main():
-    job_url = "https://join.com/companies/cross-solution/13623052-software-developer-typescript?pid=e65242534431eadcb0c9"  # Use a real job posting URL
-    company_url = "https://join.com/companies/cross-solution/13623052-software-developer-typescript?pid=e65242534431eadcb0c9"  # Use a real company URL
-    resume_path = "backend/agents/Sina korhani Shirazi - Resume (6).pdf"
+    job_url = "https://join.com/companies/cross-solution/13623052-software-developer-typescript?pid=e65242534431eadcb0c9"
+    # Commenting out company_url since we're not using it
+    # company_url = "https://join.com/companies/cross-solution/13623052-software-developer-typescript?pid=e65242534431eadcb0c9"
+    resume_path = "agents/Sina korhani Shirazi - Resume (6).pdf"
     
-    result = await process_application(job_url, company_url, resume_path)
+    if not os.path.exists(resume_path):
+        print(f"Error: Resume file not found at {resume_path}")
+        return
+        
+    # Pass None or empty string for company_url
+    result = await process_application(job_url, "", resume_path)
     print("Optimization Result:", result)
 
 if __name__ == "__main__":
